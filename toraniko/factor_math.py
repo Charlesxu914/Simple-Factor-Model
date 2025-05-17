@@ -195,4 +195,4 @@ def exp_weights(window: int, half_life: int) -> np.ndarray:
     except (AttributeError, AssertionError) as e:
         raise TypeError("`half_life` must be an integer type") from e
     decay = np.log(2) / half_life
-    return np.exp(-decay * np.arange(window))[::-1]
+    return np.exp(-decay * np.arange(window))[::-1] 
