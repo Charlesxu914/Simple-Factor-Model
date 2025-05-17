@@ -1,2 +1,4 @@
 numpy~=1.26.2
+pandas>=2.2
 polars~=1.0
+norgatedata 
