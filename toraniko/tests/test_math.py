@@ -5,7 +5,7 @@ import polars as pl
 import numpy as np
 from polars.testing import assert_frame_equal
 
-from toraniko.math import (
+from toraniko.factor_math import (
     center_xsection,
     exp_weights,
     norm_xsection,
