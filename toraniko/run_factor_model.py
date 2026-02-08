@@ -12,7 +12,6 @@ import polars as pl
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn as sns
 import os
 import logging
 from datetime import datetime
@@ -45,105 +44,67 @@ def run_full_model():
     # 2. Construct style factors
     logger.info("Constructing style factors")
     
+    # Build each factor, collecting successes
+    factor_dfs = {}  # name -> (df, score_col)
+
     try:
-        # Momentum factor
-        logger.info("Constructing momentum factor")
+        # Determine available trading days to size the momentum window
+        n_trading_days = returns_df['date'].n_unique()
+        trailing_days = min(504, n_trading_days - 30)  # Need room for lag
+        half_life = max(21, trailing_days // 4)
+        lag = min(20, max(1, n_trading_days // 20))
+        logger.info(f"Constructing momentum factor (trailing={trailing_days}, half_life={half_life}, lag={lag})")
         mom_df = styles.factor_mom(
             returns_df=returns_df,
-            trailing_days=504,  # ~2 years of trading days
-            half_life=126,      # ~6 months decay
-            lag=20,             # 1 month lag to avoid short-term reversal
-            winsor_factor=0.01  # Winsorize at 1%
+            trailing_days=trailing_days,
+            half_life=half_life,
+            lag=lag,
+            winsor_factor=0.01
         ).collect()
+        factor_dfs['MOMENTUM'] = (mom_df, 'mom_score')
     except Exception as e:
-        logger.warning(f"Failed to construct momentum factor: {e}. Using empty DataFrame.")
-        # Create empty momentum factor DataFrame with the right structure
-        mom_df = pl.DataFrame({
-            'date': returns_df['date'].unique(),
-            'symbol': pl.Series(['PLACEHOLDER']),
-            'mom_score': pl.Series([0.0])
-        }).explode('symbol')
-    
+        logger.warning(f"Failed to construct momentum factor: {e}")
+
     try:
-        # Size factor
         logger.info("Constructing size factor")
         sze_df = styles.factor_sze(
             mkt_cap_df=mkt_cap_df,
-            lower_decile=0.2,   # Exclude smallest 20%
-            upper_decile=0.8    # Exclude largest 20%
+            lower_decile=0.2,
+            upper_decile=0.8
         ).collect()
+        factor_dfs['SIZE'] = (sze_df, 'sze_score')
     except Exception as e:
-        logger.warning(f"Failed to construct size factor: {e}. Using empty DataFrame.")
-        # Create empty size factor DataFrame with the right structure
-        sze_df = pl.DataFrame({
-            'date': returns_df['date'].unique(),
-            'symbol': pl.Series(['PLACEHOLDER']),
-            'sze_score': pl.Series([0.0])
-        }).explode('symbol')
-    
+        logger.warning(f"Failed to construct size factor: {e}")
+
     try:
-        # Value factor
         logger.info("Constructing value factor")
         val_df = styles.factor_val(
             value_df=value_df,
-            winsorize_features=0.01  # Winsorize at 1%
+            winsorize_features=0.01
         ).collect()
+        factor_dfs['VALUE'] = (val_df, 'val_score')
     except Exception as e:
-        logger.warning(f"Failed to construct value factor: {e}. Using empty DataFrame.")
-        # Create empty value factor DataFrame with the right structure
-        val_df = pl.DataFrame({
-            'date': returns_df['date'].unique(),
-            'symbol': pl.Series(['PLACEHOLDER']),
-            'val_score': pl.Series([0.0])
-        }).explode('symbol')
-    
-    # Check if any factors were successfully created
-    created_factors = []
-    if not mom_df.filter(pl.col('symbol') != 'PLACEHOLDER').is_empty():
-        created_factors.append('MOMENTUM')
-    if not sze_df.filter(pl.col('symbol') != 'PLACEHOLDER').is_empty():
-        created_factors.append('SIZE')
-    if not val_df.filter(pl.col('symbol') != 'PLACEHOLDER').is_empty():
-        created_factors.append('VALUE')
-    
-    if not created_factors:
+        logger.warning(f"Failed to construct value factor: {e}")
+
+    if not factor_dfs:
         logger.error("All factor constructions failed. Cannot proceed.")
         return
-    
-    logger.info(f"Successfully created the following factors: {', '.join(created_factors)}")
-    
+
+    created_factors = list(factor_dfs.keys())
+    logger.info(f"Successfully created factors: {', '.join(created_factors)}")
+
+    # Combine all style factors by joining onto the base date-symbol pairs
     try:
-        # Combine all style factors using joins with appropriate handling of potential mismatches
-        style_df_parts = []
-        
-        # Start with a base DataFrame derived from symbol-date combinations in the returns DataFrame
-        base_df = returns_df.select(['date', 'symbol']).unique()
-        
-        # Momentum factor
-        if 'MOMENTUM' in created_factors:
-            mom_subset = mom_df.filter(pl.col('symbol') != 'PLACEHOLDER')
-            style_df_parts.append(mom_subset.rename({'mom_score': 'MOMENTUM'}))
-            
-        # Size factor
-        if 'SIZE' in created_factors:
-            sze_subset = sze_df.filter(pl.col('symbol') != 'PLACEHOLDER')
-            style_df_parts.append(sze_subset.rename({'sze_score': 'SIZE'}))
-            
-        # Value factor
-        if 'VALUE' in created_factors:
-            val_subset = val_df.filter(pl.col('symbol') != 'PLACEHOLDER')
-            style_df_parts.append(val_subset.rename({'val_score': 'VALUE'}))
-        
-        # Combine the factors
-        style_df = base_df
-        for factor_df in style_df_parts:
-            style_df = style_df.join(factor_df, on=['date', 'symbol'], how='left')
-        
-        # Fill any missing values
-        for factor in created_factors:
-            style_df = style_df.with_columns([
-                pl.col(factor).fill_null(0).alias(factor)
-            ])
+        style_df = returns_df.select(['date', 'symbol']).unique()
+        for name, (df, score_col) in factor_dfs.items():
+            renamed = df.rename({score_col: name})
+            style_df = style_df.join(renamed, on=['date', 'symbol'], how='left')
+
+        # Fill missing factor scores (null and NaN) with 0
+        for name in created_factors:
+            style_df = style_df.with_columns(
+                pl.col(name).fill_null(0).fill_nan(0)
+            )
     except Exception as e:
         logger.error(f"Failed to combine style factors: {e}")
         return
