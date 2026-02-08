@@ -19,12 +19,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger('yfinance_data_loader')
 
-# Configuration
-START_DATE = "2020-01-01"
-END_DATE = datetime.now().strftime("%Y-%m-%d")
+# Configuration — update these to control the data range and universe
+START_DATE = "2020-01-01"  # Earliest date to include
+END_DATE = datetime.now().strftime("%Y-%m-%d")  # Defaults to today
 OUTPUT_DIR = "./data"
-TEST_MODE = False  # Set to False to process full S&P 500
-TEST_TICKERS = ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL']  # Test with top 5 tech stocks
+TEST_MODE = False  # Set True to use only TEST_TICKERS (faster iteration)
+TEST_TICKERS = ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL']
+FORCE_REFRESH = False  # Set True to re-fetch even if cached parquet files exist
 
 try:
     import yfinance as yf
@@ -52,8 +53,11 @@ def get_sp500_tickers():
     
     try:
         logger.info("Fetching S&P 500 tickers from Wikipedia")
-        # Use pandas to read the S&P 500 table from Wikipedia
-        tables = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+        import urllib.request
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        html = urllib.request.urlopen(req).read().decode('utf-8')
+        tables = pd.read_html(html)
         sp500_df = tables[0]
         tickers = sp500_df['Symbol'].str.replace('.', '-').tolist()
         logger.info(f"Found {len(tickers)} S&P 500 constituents")
@@ -181,110 +185,102 @@ def create_returns_df(price_df):
     logger.info(f"Returns calculation complete. Shape: {returns_df.shape}")
     return returns_df
     
-def fetch_market_cap_data(tickers, price_df=None, start_date=START_DATE, end_date=END_DATE, batch_size=20):
+def fetch_ticker_info(tickers, batch_size=20):
     """
-    Fetches historical market cap data by combining:
-    1. Current shares outstanding from ticker.info
-    2. Historical price data
-    
-    This is an approximation since yfinance doesn't provide historical shares outstanding.
+    Fetches .info for all tickers in a single pass, returning shares outstanding
+    and sector data. This avoids making duplicate API calls.
+
+    Returns: (shares_data: dict, sector_data: list[dict])
     """
+    import time
+
     if not YFINANCE_AVAILABLE:
-        logger.warning("Cannot fetch real market cap data. yfinance package not available.")
-        return None
-        
+        return {}, []
+
+    logger.info(f"Fetching ticker info (shares + sector) for {len(tickers)} tickers")
+
+    shares_data = {}
+    sector_data = []
+
+    for i in range(0, len(tickers), batch_size):
+        batch_tickers = tickers[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (len(tickers) + batch_size - 1) // batch_size
+        logger.info(f"Fetching ticker info - batch {batch_num}/{total_batches}")
+
+        for ticker in batch_tickers:
+            try:
+                info = yf.Ticker(ticker).info
+
+                # Shares outstanding
+                for field in ['sharesOutstanding', 'impliedSharesOutstanding']:
+                    if field in info and info[field] and info[field] > 0:
+                        shares_data[ticker] = info[field]
+                        break
+
+                # Sector
+                if 'sector' in info and info['sector']:
+                    sector_data.append({'symbol': ticker, 'sector': info['sector']})
+            except Exception as e:
+                logger.error(f"Error fetching info for {ticker}: {e}")
+
+        time.sleep(1)  # Rate-limit protection
+
+    logger.info(f"Got shares for {len(shares_data)} tickers, sector for {len(sector_data)} tickers")
+    return shares_data, sector_data
+
+
+def fetch_market_cap_data(tickers, price_df=None, shares_data=None, batch_size=20):
+    """
+    Computes historical market cap using shares outstanding and price data.
+    If shares_data is not provided, fetches it from yfinance.
+    """
     if price_df is None or price_df.is_empty():
         logger.error("Price data is required to calculate market cap")
         return None
-        
-    logger.info(f"Fetching market cap data for {len(tickers)} tickers")
-    
-    # Get current shares outstanding for each ticker
-    shares_data = {}
-    for i in range(0, len(tickers), batch_size):
-        batch_tickers = tickers[i:i + batch_size]
-        logger.info(f"Fetching shares data - batch {i//batch_size + 1}/{(len(tickers) + batch_size - 1)//batch_size}")
-        
-        for ticker in batch_tickers:
-            try:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                
-                # Try different fields that might contain shares outstanding
-                shares_outstanding = None
-                for field in ['sharesOutstanding', 'impliedSharesOutstanding']:
-                    if field in info and info[field] and info[field] > 0:
-                        shares_outstanding = info[field]
-                        break
-                
-                if shares_outstanding:
-                    shares_data[ticker] = shares_outstanding
-                else:
-                    logger.warning(f"No shares outstanding data found for {ticker}")
-            except Exception as e:
-                logger.error(f"Error fetching data for {ticker}: {e}")
-    
+
+    if shares_data is None:
+        shares_data, _ = fetch_ticker_info(tickers, batch_size)
+
     if not shares_data:
-        logger.error("No shares outstanding data fetched for any tickers")
+        logger.error("No shares outstanding data available")
         return None
-    
-    # Calculate market cap for each date-symbol pair
+
     logger.info("Calculating market cap using price data and shares outstanding")
-    
+
     mkt_cap_df = (
         price_df.select(["date", "symbol", "adj_close"])
         .with_columns([
-            pl.col("symbol").map_elements(lambda s: shares_data.get(s, None), return_dtype=pl.Float64).alias("shares_outstanding")
+            pl.col("symbol").map_elements(
+                lambda s: float(shares_data[s]) if s in shares_data else None,
+                return_dtype=pl.Float64
+            ).alias("shares_outstanding")
         ])
-        .filter(pl.col("shares_outstanding").is_not_null())  # Remove tickers with no shares data
+        .filter(pl.col("shares_outstanding").is_not_null())
         .with_columns([
             (pl.col("adj_close") * pl.col("shares_outstanding")).alias("market_cap")
         ])
         .select(["date", "symbol", "market_cap"])
     )
-    
+
     logger.info(f"Market cap calculation complete. Shape: {mkt_cap_df.shape}")
     return mkt_cap_df
 
-def fetch_sector_data(tickers, batch_size=20):
+
+def fetch_sector_data(tickers, sector_data=None, batch_size=20):
     """
-    Fetches sector information for each ticker.
     Returns a DataFrame with ticker -> sector mapping.
+    If sector_data list is not provided, fetches it from yfinance.
     """
-    if not YFINANCE_AVAILABLE:
-        logger.warning("Cannot fetch real sector data. yfinance package not available.")
-        return None
-        
-    logger.info(f"Fetching sector data for {len(tickers)} tickers")
-    
-    sector_data = []
-    for i in range(0, len(tickers), batch_size):
-        batch_tickers = tickers[i:i + batch_size]
-        logger.info(f"Fetching sector data - batch {i//batch_size + 1}/{(len(tickers) + batch_size - 1)//batch_size}")
-        
-        for ticker in batch_tickers:
-            try:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                
-                if 'sector' in info and info['sector']:
-                    sector_data.append({
-                        'symbol': ticker,
-                        'sector': info['sector']
-                    })
-                else:
-                    logger.warning(f"No sector data found for {ticker}")
-            except Exception as e:
-                logger.error(f"Error fetching sector data for {ticker}: {e}")
-    
+    if sector_data is None:
+        _, sector_data = fetch_ticker_info(tickers, batch_size)
+
     if not sector_data:
-        logger.error("No sector data fetched for any tickers")
+        logger.error("No sector data available")
         return None
-        
-    # Create DataFrame from sector data
+
     sector_df = pl.DataFrame(sector_data)
-    logger.info(f"Sector data fetched for {sector_df.height} tickers with {sector_df['sector'].n_unique()} unique sectors")
-    
+    logger.info(f"Sector data: {sector_df.height} tickers, {sector_df['sector'].n_unique()} unique sectors")
     return sector_df
     
 def create_sector_exposure_df(sector_df, price_df):
@@ -364,349 +360,224 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
     Fetches fundamental data needed for value metrics.
     Returns a DataFrame with: date, symbol, book_price, sales_price, cf_price
     """
+    import time
+
     if not YFINANCE_AVAILABLE:
         logger.warning("Cannot fetch real value metrics. yfinance package not available.")
         return None
-        
+
     if price_df is None or price_df.is_empty():
         logger.error("Price data is required to calculate value metrics")
         return None
-        
+
     logger.info(f"Fetching value metrics data for {len(tickers)} tickers")
-    
-    # Dictionary to store latest fundamental data for each ticker
-    fundamental_data = {}
-    
+
+    # Collect fundamental snapshots: list of dicts with {date, symbol, book_value, revenue, cash_flow}
+    fund_rows = []
+    fetched_count = 0
+
     for i in range(0, len(tickers), batch_size):
         batch_tickers = tickers[i:i + batch_size]
-        logger.info(f"Fetching fundamental data - batch {i//batch_size + 1}/{(len(tickers) + batch_size - 1)//batch_size}")
-        
+        batch_num = i // batch_size + 1
+        total_batches = (len(tickers) + batch_size - 1) // batch_size
+        logger.info(f"Fetching fundamental data - batch {batch_num}/{total_batches}")
+
         for ticker in batch_tickers:
             try:
                 stock = yf.Ticker(ticker)
-                
-                # Get quarterly balance sheet data
+
+                # Get balance sheet (quarterly preferred, fall back to annual)
                 balance_sheet = stock.quarterly_balance_sheet
-                # Get quarterly financials (income statement)
+                if balance_sheet.empty:
+                    balance_sheet = stock.balance_sheet
                 financials = stock.quarterly_financials
-                # Get quarterly cash flow
                 cash_flow = stock.quarterly_cashflow
-                
+
                 if balance_sheet.empty and financials.empty and cash_flow.empty:
                     logger.warning(f"No fundamental data found for {ticker}")
                     continue
-                    
-                # Extract data for each reporting date
-                fundamental_dates = sorted(set(
-                    balance_sheet.columns.tolist() + 
+
+                # Collect all reporting dates across the three statements
+                all_dates = sorted(set(
+                    balance_sheet.columns.tolist() +
                     financials.columns.tolist() +
                     cash_flow.columns.tolist()
                 ))
-                
-                ticker_data = {}
-                for date in fundamental_dates:
-                    data_point = {'date': date}
-                    
-                    # Book value (Total Assets - Total Liabilities)
-                    if not balance_sheet.empty:
-                        if 'Total Assets' in balance_sheet.index and date in balance_sheet.columns:
-                            assets = balance_sheet.loc['Total Assets', date]
-                            liabilities = balance_sheet.loc['Total Liabilities Net Minority Interest', date] if 'Total Liabilities Net Minority Interest' in balance_sheet.index else None
-                            
-                            if assets is not None and liabilities is not None and not pd.isna(assets) and not pd.isna(liabilities):
-                                data_point['book_value'] = assets - liabilities
-                    
-                    # Sales (Revenue)
-                    if not financials.empty:
-                        if 'Total Revenue' in financials.index and date in financials.columns:
-                            revenue = financials.loc['Total Revenue', date]
-                            if revenue is not None and not pd.isna(revenue):
-                                # Annualize quarterly revenue
-                                data_point['revenue'] = revenue * 4
-                    
-                    # Cash Flow
-                    if not cash_flow.empty:
-                        if 'Operating Cash Flow' in cash_flow.index and date in cash_flow.columns:
-                            cf = cash_flow.loc['Operating Cash Flow', date]
-                            if cf is not None and not pd.isna(cf):
-                                # Annualize quarterly cash flow
-                                data_point['cash_flow'] = cf * 4
-                    
-                    if len(data_point) > 1:  # More than just date
-                        ticker_data[date] = data_point
-                
-                if ticker_data:
-                    fundamental_data[ticker] = ticker_data
-                
+
+                ticker_has_data = False
+                for date in all_dates:
+                    row = {'fund_date': pd.Timestamp(date), 'symbol': ticker}
+
+                    # Book value = Total Assets - Total Liabilities
+                    if not balance_sheet.empty and 'Total Assets' in balance_sheet.index and date in balance_sheet.columns:
+                        assets = balance_sheet.loc['Total Assets', date]
+                        liab_key = 'Total Liabilities Net Minority Interest'
+                        liabilities = balance_sheet.loc[liab_key, date] if liab_key in balance_sheet.index and date in balance_sheet.columns else None
+                        if assets is not None and liabilities is not None and not pd.isna(assets) and not pd.isna(liabilities):
+                            row['book_value'] = float(assets - liabilities)
+
+                    # Revenue (annualized from quarterly)
+                    if not financials.empty and 'Total Revenue' in financials.index and date in financials.columns:
+                        revenue = financials.loc['Total Revenue', date]
+                        if revenue is not None and not pd.isna(revenue):
+                            row['revenue'] = float(revenue) * 4
+
+                    # Cash flow (annualized from quarterly)
+                    if not cash_flow.empty and 'Operating Cash Flow' in cash_flow.index and date in cash_flow.columns:
+                        cf = cash_flow.loc['Operating Cash Flow', date]
+                        if cf is not None and not pd.isna(cf):
+                            row['cash_flow'] = float(cf) * 4
+
+                    if len(row) > 2:  # Has at least one metric beyond fund_date and symbol
+                        fund_rows.append(row)
+                        ticker_has_data = True
+
+                if ticker_has_data:
+                    fetched_count += 1
+
             except Exception as e:
                 logger.error(f"Error fetching fundamental data for {ticker}: {e}")
-    
-    if not fundamental_data:
+
+        # Delay between batches to avoid Yahoo Finance rate limiting
+        time.sleep(2)
+
+    logger.info(f"Fetched fundamental data for {fetched_count}/{len(tickers)} tickers")
+
+    if not fund_rows:
         logger.error("No fundamental data fetched for any ticker")
         return None
-        
-    # Create a daily value metrics DataFrame
-    logger.info("Creating daily value metrics DataFrame")
-    
-    # Get all unique dates and symbols from price data
-    unique_dates = price_df['date'].unique()
-    unique_symbols = list(set(price_df['symbol'].unique()) & set(fundamental_data.keys()))
-    
-    value_data_list = []
-    
-    # For each ticker with fundamental data
-    for symbol in unique_symbols:
-        ticker_fundamentals = fundamental_data[symbol]
-        # Sort fundamental dates
-        fundamental_dates = sorted(ticker_fundamentals.keys())
-        
-        # Get market cap data for this symbol
-        ticker_prices = price_df.filter(pl.col("symbol") == symbol)
-        
-        # For each trading day
-        for trading_date in ticker_prices['date']:
-            # Find the latest fundamental data point before this trading date
-            latest_fundamental_date = None
-            
-            # Ensure trading_date is a datetime object for comparison
-            trading_datetime = trading_date
-            if isinstance(trading_date, pl.Date):
-                trading_datetime = pd.Timestamp(trading_date.strftime("%Y-%m-%d"))
-            
-            for fund_date in reversed(fundamental_dates):
-                # Ensure fund_date is a datetime object for comparison
-                fund_datetime = fund_date
-                if isinstance(fund_date, pd.Timestamp):
-                    fund_datetime = fund_date
-                else:
-                    try:
-                        fund_datetime = pd.Timestamp(fund_date)
-                    except:
-                        # If conversion fails, skip this date
-                        logger.warning(f"Could not convert fundamental date {fund_date} to timestamp")
-                        continue
-                
-                # Compare dates
-                try:
-                    if fund_datetime < trading_datetime:
-                        latest_fundamental_date = fund_date
-                        break
-                except Exception as e:
-                    logger.error(f"Error comparing dates {fund_datetime} and {trading_datetime}: {e}")
-                    continue
-            
-            if latest_fundamental_date is None:
-                continue  # No fundamental data before this trading date
-                
-            # Get the price data for this trading day
-            price_row = ticker_prices.filter(pl.col("date") == trading_date)
-            if price_row.is_empty():
-                continue
-                
-            price = price_row['adj_close'][0]
-            
-            # Get the fundamental data
-            fund_data = ticker_fundamentals[latest_fundamental_date]
-            
-            # Calculate value metrics
-            data_point = {
-                'date': trading_date,
-                'symbol': symbol
-            }
-            
-            if 'book_value' in fund_data and price > 0:
-                data_point['book_price'] = fund_data['book_value'] / price
-            
-            if 'revenue' in fund_data and price > 0:
-                data_point['sales_price'] = fund_data['revenue'] / price
-                
-            if 'cash_flow' in fund_data and price > 0:
-                data_point['cf_price'] = fund_data['cash_flow'] / price
-            
-            # Add to list if we have at least one value metric
-            if len(data_point) > 2:  # More than just date and symbol
-                value_data_list.append(data_point)
-    
-    if not value_data_list:
-        logger.error("Could not create value metrics: No valid data points")
-        # Fallback: Create minimal value metrics from price data
-        logger.info("Creating fallback value metrics based on price")
-        
-        # We'll use price/earnings ratio as a simple proxy
-        # Since we don't have earnings, we'll generate a proxy
-        value_data_list = []
-        
-        for symbol in price_df['symbol'].unique().to_list()[:20]:  # Limit to first 20 symbols for simplicity
-            ticker_prices = price_df.filter(pl.col("symbol") == symbol)
-            
-            # Generate some synthetic book/price, sales/price and cf/price values for this ticker
-            # These will be randomized but consistent for each ticker
-            np.random.seed(hash(symbol) % 2**32)  # Use hash of symbol as random seed
-            
-            base_bp = np.random.uniform(0.5, 3.0)  # Base book/price ratio
-            base_sp = np.random.uniform(0.2, 5.0)  # Base sales/price ratio
-            base_cp = np.random.uniform(0.5, 10.0)  # Base cash-flow/price ratio
-            
-            # Add some small random fluctuations
-            for idx, row in enumerate(ticker_prices.iter_rows(named=True)):
-                # Add small fluctuations with some trend
-                factor = 1.0 + np.random.normal(0, 0.02) + (idx * 0.0001)
-                
-                value_data_list.append({
-                    'date': row['date'],
-                    'symbol': symbol,
-                    'book_price': base_bp * factor,
-                    'sales_price': base_sp * factor,
-                    'cf_price': base_cp * factor
-                })
-    
-    # Create DataFrame from list
-    value_df = pl.DataFrame(value_data_list)
-    
-    # Fill missing values by forward-filling within each symbol
-    value_df = value_df.sort(['symbol', 'date'])
-    
-    # Convert to pandas for easier forward filling
-    value_pd = value_df.to_pandas()
-    value_pd = value_pd.set_index(['symbol', 'date']).sort_index()
-    
-    # Forward fill each column
-    for col in ['book_price', 'sales_price', 'cf_price']:
-        if col in value_pd.columns:
-            value_pd[col] = value_pd.groupby('symbol')[col].ffill()
-    
-    value_pd = value_pd.reset_index()
-    
-    # Convert back to Polars
-    value_df = pl.from_pandas(value_pd).sort(['symbol', 'date'])
-    
-    # Drop rows with missing values after filling
-    value_df = value_df.drop_nulls()
-    
+
+    # Build a fundamentals DataFrame and join with prices using an asof join
+    # (much faster than the old row-by-row iteration)
+    logger.info("Creating daily value metrics DataFrame via asof join")
+
+    fund_df = pl.DataFrame(fund_rows).sort(['symbol', 'fund_date'])
+
+    # Ensure consistent date types for the asof join
+    fund_df = fund_df.with_columns(pl.col('fund_date').cast(pl.Datetime('ns')))
+
+    prices = price_df.select(['date', 'symbol', 'adj_close']).sort(['symbol', 'date'])
+    prices = prices.with_columns(pl.col('date').cast(pl.Datetime('ns')))
+
+    # Asof join: for each (symbol, trading_date), find the most recent fund_date <= trading_date
+    joined = prices.join_asof(
+        fund_df,
+        left_on='date',
+        right_on='fund_date',
+        by='symbol',
+        strategy='backward',
+    )
+
+    # Calculate value ratios: fundamental / price
+    value_exprs = []
+    if 'book_value' in joined.columns:
+        value_exprs.append(
+            pl.when(pl.col('adj_close') > 0)
+            .then(pl.col('book_value') / pl.col('adj_close'))
+            .otherwise(None)
+            .alias('book_price')
+        )
+    if 'revenue' in joined.columns:
+        value_exprs.append(
+            pl.when(pl.col('adj_close') > 0)
+            .then(pl.col('revenue') / pl.col('adj_close'))
+            .otherwise(None)
+            .alias('sales_price')
+        )
+    if 'cash_flow' in joined.columns:
+        value_exprs.append(
+            pl.when(pl.col('adj_close') > 0)
+            .then(pl.col('cash_flow') / pl.col('adj_close'))
+            .otherwise(None)
+            .alias('cf_price')
+        )
+
+    if not value_exprs:
+        logger.error("No value metrics could be computed")
+        return None
+
+    value_df = joined.select(['date', 'symbol'] + value_exprs)
+
+    # Drop rows where all value columns are null (no fundamental data available yet)
+    value_cols = [c for c in ['book_price', 'sales_price', 'cf_price'] if c in value_df.columns]
+    value_df = value_df.filter(
+        pl.any_horizontal([pl.col(c).is_not_null() for c in value_cols])
+    )
+
+    # Forward-fill remaining nulls within each symbol
+    value_df = (
+        value_df
+        .sort(['symbol', 'date'])
+        .with_columns([pl.col(c).forward_fill().over('symbol') for c in value_cols])
+        .drop_nulls()
+    )
+
     logger.info(f"Value metrics DataFrame created. Shape: {value_df.shape}")
     return value_df
 
+def _to_date_str(date_val) -> str:
+    """Convert a date value (datetime, pd.Timestamp, etc.) to 'YYYY-MM-DD' string."""
+    if hasattr(date_val, 'strftime'):
+        return date_val.strftime("%Y-%m-%d")
+    return str(date_val)
+
+
+def _filter_after_date(df, date_str):
+    """Filter a Polars DataFrame to rows on or after the given date string."""
+    return df.with_columns(
+        pl.col("date").dt.strftime("%Y-%m-%d").alias("_date_str")
+    ).filter(
+        pl.col("_date_str") >= date_str
+    ).drop("_date_str")
+
+
 def align_and_clean_data(returns_df, mkt_cap_df, sector_df, value_df, start_date=START_DATE):
     """
-    Aligns all DataFrames to the same date range and set of symbols.
-    Returns filtered and aligned DataFrames ready for the factor model.
+    Aligns all DataFrames to the same set of symbols and filters to start_date.
+
+    Date alignment is intentionally lenient: returns, market_cap, and sector data
+    keep their full history from start_date onward, while value_df may start later
+    (yfinance only provides ~2 years of quarterly fundamentals). The factor model
+    handles the mismatch — value scores are simply 0 for dates without fundamentals.
     """
-    if any(df is None or df.is_empty() for df in [returns_df, mkt_cap_df, sector_df, value_df]):
+    dfs = [returns_df, mkt_cap_df, sector_df, value_df]
+    if any(df is None or df.is_empty() for df in dfs):
         logger.error("Cannot align data: One or more DataFrames are empty")
         return None, None, None, None
-    
+
     logger.info("Aligning and cleaning all DataFrames")
-    
-    # Simple approach to find common start date
-    try:
-        # Find the min date for each DataFrame
-        min_dates = []
-        
-        # Get min date as string from returns_df
-        min_returns_date = returns_df['date'].min()
-        if isinstance(min_returns_date, datetime):
-            min_returns_date = min_returns_date.strftime("%Y-%m-%d")
-        elif isinstance(min_returns_date, pd.Timestamp):
-            min_returns_date = min_returns_date.strftime("%Y-%m-%d")
-        elif isinstance(min_returns_date, pl.Date):
-            min_returns_date = min_returns_date.strftime("%Y-%m-%d")
-        min_dates.append(min_returns_date)
-        
-        # Get min date as string from mkt_cap_df
-        min_mktcap_date = mkt_cap_df['date'].min()
-        if isinstance(min_mktcap_date, datetime):
-            min_mktcap_date = min_mktcap_date.strftime("%Y-%m-%d")
-        elif isinstance(min_mktcap_date, pd.Timestamp):
-            min_mktcap_date = min_mktcap_date.strftime("%Y-%m-%d")
-        elif isinstance(min_mktcap_date, pl.Date):
-            min_mktcap_date = min_mktcap_date.strftime("%Y-%m-%d")
-        min_dates.append(min_mktcap_date)
-        
-        # Get min date as string from sector_df
-        min_sector_date = sector_df['date'].min()
-        if isinstance(min_sector_date, datetime):
-            min_sector_date = min_sector_date.strftime("%Y-%m-%d")
-        elif isinstance(min_sector_date, pd.Timestamp):
-            min_sector_date = min_sector_date.strftime("%Y-%m-%d")
-        elif isinstance(min_sector_date, pl.Date):
-            min_sector_date = min_sector_date.strftime("%Y-%m-%d")
-        min_dates.append(min_sector_date)
-        
-        # Get min date as string from value_df
-        min_value_date = value_df['date'].min()
-        if isinstance(min_value_date, datetime):
-            min_value_date = min_value_date.strftime("%Y-%m-%d")
-        elif isinstance(min_value_date, pd.Timestamp):
-            min_value_date = min_value_date.strftime("%Y-%m-%d")
-        elif isinstance(min_value_date, pl.Date):
-            min_value_date = min_value_date.strftime("%Y-%m-%d")
-        min_dates.append(min_value_date)
-        
-        # Add the user-specified start date
-        min_dates.append(start_date)
-        
-        # Convert all to pd.Timestamp for comparison
-        min_dates_pd = [pd.Timestamp(d) for d in min_dates]
-        
-        # Find the max date among all min dates
-        common_start_date = max(min_dates_pd)
-        common_start_str = common_start_date.strftime("%Y-%m-%d")
-        
-        logger.info(f"Using common start date: {common_start_str}")
-    except Exception as e:
-        logger.error(f"Error determining common start date: {e}")
-        common_start_str = start_date
-        logger.info(f"Falling back to configured start date: {common_start_str}")
-    
-    # Convert string date to pandas Timestamp for filtering
-    common_start_date_pd = pd.Timestamp(common_start_str)
-    
-    # Filter each DataFrame
-    # Convert date column to string for comparison to avoid type issues
-    returns_df = returns_df.with_columns([
-        pl.col("date").dt.strftime("%Y-%m-%d").alias("date_str")
-    ]).filter(
-        pl.col("date_str") >= common_start_str
-    ).drop("date_str")
-    
-    mkt_cap_df = mkt_cap_df.with_columns([
-        pl.col("date").dt.strftime("%Y-%m-%d").alias("date_str")
-    ]).filter(
-        pl.col("date_str") >= common_start_str
-    ).drop("date_str")
-    
-    sector_df = sector_df.with_columns([
-        pl.col("date").dt.strftime("%Y-%m-%d").alias("date_str")
-    ]).filter(
-        pl.col("date_str") >= common_start_str
-    ).drop("date_str")
-    
-    value_df = value_df.with_columns([
-        pl.col("date").dt.strftime("%Y-%m-%d").alias("date_str")
-    ]).filter(
-        pl.col("date_str") >= common_start_str
-    ).drop("date_str")
-    
+
+    # Filter each DataFrame to start_date (not to the latest common start)
+    returns_df = _filter_after_date(returns_df, start_date)
+    mkt_cap_df = _filter_after_date(mkt_cap_df, start_date)
+    sector_df = _filter_after_date(sector_df, start_date)
+    value_df = _filter_after_date(value_df, start_date)
+
+    # Log per-DataFrame date ranges for transparency
+    for name, df in [('returns', returns_df), ('mkt_cap', mkt_cap_df),
+                     ('sector', sector_df), ('value', value_df)]:
+        logger.info(f"  {name}: {_to_date_str(df['date'].min())} → {_to_date_str(df['date'].max())} ({df.height:,} rows)")
+
     # Find symbols common to all DataFrames
     common_symbols = set(returns_df['symbol'].unique().to_list())
-    common_symbols &= set(mkt_cap_df['symbol'].unique().to_list())
-    common_symbols &= set(sector_df['symbol'].unique().to_list())
-    common_symbols &= set(value_df['symbol'].unique().to_list())
-    
+    for df in [mkt_cap_df, sector_df, value_df]:
+        common_symbols &= set(df['symbol'].unique().to_list())
+
     logger.info(f"Found {len(common_symbols)} symbols common to all datasets")
-    
+
     if len(common_symbols) == 0:
         logger.error("No common symbols across all DataFrames")
         return None, None, None, None
-        
+
     # Filter to common symbols
-    returns_df = returns_df.filter(pl.col('symbol').is_in(list(common_symbols)))
-    mkt_cap_df = mkt_cap_df.filter(pl.col('symbol').is_in(list(common_symbols)))
-    sector_df = sector_df.filter(pl.col('symbol').is_in(list(common_symbols)))
-    value_df = value_df.filter(pl.col('symbol').is_in(list(common_symbols)))
-    
+    sym_list = list(common_symbols)
+    returns_df = returns_df.filter(pl.col('symbol').is_in(sym_list))
+    mkt_cap_df = mkt_cap_df.filter(pl.col('symbol').is_in(sym_list))
+    sector_df = sector_df.filter(pl.col('symbol').is_in(sym_list))
+    value_df = value_df.filter(pl.col('symbol').is_in(sym_list))
+
     logger.info(f"Data alignment complete. Shapes - returns: {returns_df.shape}, market_cap: {mkt_cap_df.shape}, sector: {sector_df.shape}, value: {value_df.shape}")
-    
+
     return returns_df, mkt_cap_df, sector_df, value_df
     
 def save_data_to_files(returns_df, mkt_cap_df, sector_df, value_df, output_dir=OUTPUT_DIR):
@@ -782,38 +653,29 @@ def load_saved_data(input_dir=OUTPUT_DIR):
         logger.error(f"Error loading data: {str(e)}")
         return None, None, None, None
 
-def run_loader_and_model():
+def run_loader_and_model(force_refresh=None):
     """
-    Utility function to load data and run the factor model in one step.
-    This can be imported and called from other scripts.
-    
-    Steps:
-    1. Check if data already exists
-    2. If not, fetch and save data
-    3. Return data for model usage
+    Load data (from cache or by fetching fresh), returning the four DataFrames.
+
+    Set force_refresh=True (or the module-level FORCE_REFRESH=True) to
+    re-download from Yahoo Finance even when cached parquet files exist.
     """
+    if force_refresh is None:
+        force_refresh = FORCE_REFRESH
+
     data_dir = OUTPUT_DIR
-    
-    # Check if data files already exist
-    if (os.path.exists(f"{data_dir}/returns_df.parquet") and
-        os.path.exists(f"{data_dir}/mkt_cap_df.parquet") and
-        os.path.exists(f"{data_dir}/sector_df.parquet") and 
-        os.path.exists(f"{data_dir}/value_df.parquet")):
-        
+    parquet_files = [f"{data_dir}/{f}.parquet" for f in
+                     ("returns_df", "mkt_cap_df", "sector_df", "value_df")]
+
+    if not force_refresh and all(os.path.exists(f) for f in parquet_files):
         logger.info("Found existing data files, loading them...")
-        returns_df, mkt_cap_df, sector_df, value_df = load_saved_data()
-        
-        if returns_df is not None:
+        result = load_saved_data()
+        if result[0] is not None:
             logger.info("Successfully loaded existing data")
-            return returns_df, mkt_cap_df, sector_df, value_df
-    
-    # If we get here, we need to fetch new data
-    logger.info("No existing data found or loading failed, fetching new data...")
-    
-    # Run the main data collection process
+            return result
+
+    logger.info("Fetching new data...")
     main()
-    
-    # Load and return the newly created data
     return load_saved_data()
 
 def main():
@@ -838,11 +700,13 @@ def main():
             logger.error("Failed to calculate returns, exiting.")
             return
         
-        # 3. Fetch market cap data
-        mkt_cap_df = fetch_market_cap_data(tickers, price_df)
+        # 3. Fetch ticker info (shares + sector) in a single pass to reduce API calls
+        shares_data, sector_list = fetch_ticker_info(tickers)
+
+        # 4. Compute market cap from shares outstanding + prices
+        mkt_cap_df = fetch_market_cap_data(tickers, price_df, shares_data=shares_data)
         if mkt_cap_df is None or mkt_cap_df.is_empty():
             logger.warning("Failed to fetch market cap data, creating fallback data...")
-            # Create a fallback market cap (using price as proxy with random multiplier)
             np.random.seed(42)
             mkt_cap_df = price_df.select(['date', 'symbol', 'adj_close']) \
                 .with_columns([
@@ -852,9 +716,9 @@ def main():
                     )).alias('market_cap')
                 ]) \
                 .select(['date', 'symbol', 'market_cap'])
-        
-        # 4. Fetch sector information and create sector exposure DataFrame
-        sector_info_df = fetch_sector_data(tickers)
+
+        # 5. Create sector exposure DataFrame
+        sector_info_df = fetch_sector_data(tickers, sector_data=sector_list)
         if sector_info_df is None or sector_info_df.is_empty():
             logger.warning("Failed to fetch sector data, creating fallback sectors...")
             # Create fallback sector data
@@ -872,13 +736,13 @@ def main():
             logger.error("Failed to create sector exposure data, exiting.")
             return
         
-        # 5. Fetch value metrics data
+        # 6. Fetch value metrics (fundamentals) data
         value_df = fetch_value_metrics_data(tickers, price_df)
         if value_df is None or value_df.is_empty():
             logger.error("Failed to create value metrics, exiting.")
             return
-        
-        # 6. Align and clean all DataFrames
+
+        # 7. Align and clean all DataFrames
         aligned_dfs = align_and_clean_data(returns_df, mkt_cap_df, sector_df, value_df)
         if aligned_dfs[0] is None:
             logger.error("Data alignment failed, saving unaligned data...")
