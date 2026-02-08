@@ -355,6 +355,33 @@ def create_sector_exposure_df(sector_df, price_df):
         # Create a minimal DataFrame with just date and symbol
         return price_df.select(["date", "symbol"]).unique()
         
+def _merge_statements(quarterly_df, annual_df):
+    """Merge quarterly and annual financial statements, preferring quarterly for overlapping dates.
+
+    Quarterly data is more granular but only covers ~1.5 years.
+    Annual data covers 4-5 years. Combining both gives maximum history.
+    When both have data for the same date, quarterly takes precedence.
+    """
+    if quarterly_df.empty and annual_df.empty:
+        return quarterly_df  # return empty
+    if quarterly_df.empty:
+        return annual_df
+    if annual_df.empty:
+        return quarterly_df
+
+    # Get dates unique to annual (not already covered by quarterly)
+    quarterly_dates = set(quarterly_df.columns)
+    annual_only_dates = [d for d in annual_df.columns if d not in quarterly_dates]
+
+    if not annual_only_dates:
+        return quarterly_df  # quarterly already covers everything
+
+    # Combine: quarterly columns first, then annual-only columns
+    import pandas as pd
+    combined = pd.concat([quarterly_df, annual_df[annual_only_dates]], axis=1)
+    return combined
+
+
 def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_date=END_DATE, batch_size=20):
     """
     Fetches fundamental data needed for value metrics.
@@ -386,14 +413,29 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
             try:
                 stock = yf.Ticker(ticker)
 
-                # Get balance sheet (quarterly preferred, fall back to annual)
-                balance_sheet = stock.quarterly_balance_sheet
-                if balance_sheet.empty:
-                    balance_sheet = stock.balance_sheet
-                financials = stock.quarterly_financials
-                cash_flow = stock.quarterly_cashflow
+                # Combine quarterly + annual data for maximum history coverage
+                # Quarterly gives ~6 quarters (~1.5 yrs), annual gives 4-5 years
+                q_balance = stock.quarterly_balance_sheet
+                q_financials = stock.quarterly_financials
+                q_cashflow = stock.quarterly_cashflow
+                a_balance = stock.balance_sheet
+                a_financials = stock.income_stmt
+                a_cashflow = stock.cashflow
 
-                if balance_sheet.empty and financials.empty and cash_flow.empty:
+                # Track which dates come from quarterly (need *4) vs annual (already annualized)
+                quarterly_dates = set()
+                if not q_balance.empty:
+                    quarterly_dates.update(q_balance.columns.tolist())
+                if not q_financials.empty:
+                    quarterly_dates.update(q_financials.columns.tolist())
+                if not q_cashflow.empty:
+                    quarterly_dates.update(q_cashflow.columns.tolist())
+
+                balance_sheet = _merge_statements(q_balance, a_balance)
+                financials = _merge_statements(q_financials, a_financials)
+                cash_flow_stmt = _merge_statements(q_cashflow, a_cashflow)
+
+                if balance_sheet.empty and financials.empty and cash_flow_stmt.empty:
                     logger.warning(f"No fundamental data found for {ticker}")
                     continue
 
@@ -401,14 +443,15 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
                 all_dates = sorted(set(
                     balance_sheet.columns.tolist() +
                     financials.columns.tolist() +
-                    cash_flow.columns.tolist()
+                    cash_flow_stmt.columns.tolist()
                 ))
 
                 ticker_has_data = False
                 for date in all_dates:
                     row = {'fund_date': pd.Timestamp(date), 'symbol': ticker}
+                    is_quarterly = date in quarterly_dates
 
-                    # Book value = Total Assets - Total Liabilities
+                    # Book value = Total Assets - Total Liabilities (no annualization needed)
                     if not balance_sheet.empty and 'Total Assets' in balance_sheet.index and date in balance_sheet.columns:
                         assets = balance_sheet.loc['Total Assets', date]
                         liab_key = 'Total Liabilities Net Minority Interest'
@@ -416,17 +459,17 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
                         if assets is not None and liabilities is not None and not pd.isna(assets) and not pd.isna(liabilities):
                             row['book_value'] = float(assets - liabilities)
 
-                    # Revenue (annualized from quarterly)
+                    # Revenue — annualize quarterly figures (*4), keep annual as-is
                     if not financials.empty and 'Total Revenue' in financials.index and date in financials.columns:
                         revenue = financials.loc['Total Revenue', date]
                         if revenue is not None and not pd.isna(revenue):
-                            row['revenue'] = float(revenue) * 4
+                            row['revenue'] = float(revenue) * 4 if is_quarterly else float(revenue)
 
-                    # Cash flow (annualized from quarterly)
-                    if not cash_flow.empty and 'Operating Cash Flow' in cash_flow.index and date in cash_flow.columns:
-                        cf = cash_flow.loc['Operating Cash Flow', date]
+                    # Cash flow — annualize quarterly figures (*4), keep annual as-is
+                    if not cash_flow_stmt.empty and 'Operating Cash Flow' in cash_flow_stmt.index and date in cash_flow_stmt.columns:
+                        cf = cash_flow_stmt.loc['Operating Cash Flow', date]
                         if cf is not None and not pd.isna(cf):
-                            row['cash_flow'] = float(cf) * 4
+                            row['cash_flow'] = float(cf) * 4 if is_quarterly else float(cf)
 
                     if len(row) > 2:  # Has at least one metric beyond fund_date and symbol
                         fund_rows.append(row)

@@ -50,7 +50,7 @@ def run_full_model():
     try:
         # Determine available trading days to size the momentum window
         n_trading_days = returns_df['date'].n_unique()
-        trailing_days = min(504, n_trading_days - 30)  # Need room for lag
+        trailing_days = min(252, n_trading_days - 30)  # ~1 year lookback
         half_life = max(21, trailing_days // 4)
         lag = min(20, max(1, n_trading_days // 20))
         logger.info(f"Constructing momentum factor (trailing={trailing_days}, half_life={half_life}, lag={lag})")
