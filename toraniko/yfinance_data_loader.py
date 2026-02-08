@@ -1,8 +1,9 @@
 """
-S&P 500 data loader using Yahoo Finance.
+Equity factor model data loader using Yahoo Finance.
 
-This script implements a data pipeline to fetch S&P 500 historical data,
-creating all the necessary DataFrames for the equity factor model.
+This script implements a data pipeline to fetch historical data for an
+equity universe (S&P 500 or Russell 3000), creating all the necessary
+DataFrames for the factor model.
 """
 
 import numpy as np
@@ -11,10 +12,14 @@ import pandas as pd
 from datetime import datetime, timedelta
 import logging
 import os
+import random
+import time as time_module
+
+from toraniko.ticker_universe import get_tickers, UNIVERSE_SP500, UNIVERSE_RUSSELL3000
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('yfinance_data_loader')
@@ -23,6 +28,7 @@ logger = logging.getLogger('yfinance_data_loader')
 START_DATE = "2020-01-01"  # Earliest date to include
 END_DATE = datetime.now().strftime("%Y-%m-%d")  # Defaults to today
 OUTPUT_DIR = "./data"
+UNIVERSE = UNIVERSE_SP500  # Default universe; override via main(universe=...)
 TEST_MODE = False  # Set True to use only TEST_TICKERS (faster iteration)
 TEST_TICKERS = ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL']
 FORCE_REFRESH = False  # Set True to re-fetch even if cached parquet files exist
@@ -33,42 +39,66 @@ try:
 except ImportError:
     logger.warning("yfinance package not available. Install using: pip install yfinance")
     YFINANCE_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Helpers: retry, rate-limit params, progress
+# ---------------------------------------------------------------------------
+def _retry_with_backoff(func, max_retries=3, base_delay=2.0, label=""):
+    """Execute *func()*, retrying with exponential backoff on failure."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            logger.warning(
+                f"{label} attempt {attempt + 1} failed: {e}. "
+                f"Retrying in {delay:.1f}s..."
+            )
+            time_module.sleep(delay)
+
+
+def _get_rate_params(n_tickers: int) -> dict:
+    """Return batch sizes and delays tuned for the universe size."""
+    if n_tickers > 1000:
+        return {
+            "price_batch": 50, "price_delay": 1,
+            "info_batch": 10, "info_delay": 2,
+            "fund_batch": 10, "fund_delay": 3,
+        }
+    return {
+        "price_batch": 100, "price_delay": 0,
+        "info_batch": 20, "info_delay": 1,
+        "fund_batch": 20, "fund_delay": 2,
+    }
+
+
+def _eta_str(start_time, done, total):
+    """Return a human-readable ETA string."""
+    if done == 0:
+        return "calculating..."
+    elapsed = time_module.time() - start_time
+    rate = elapsed / done
+    remaining = rate * (total - done)
+    if remaining < 60:
+        return f"{remaining:.0f}s"
+    return f"{remaining / 60:.1f}min"
+
+
+def _get_output_dir(universe: str) -> str:
+    """Return the universe-specific data directory."""
+    return os.path.join(OUTPUT_DIR, universe)
     
 def get_sp500_tickers():
-    """
-    Fetches current S&P 500 constituents by scraping Wikipedia.
-    Returns a list of ticker symbols.
-    """
+    """Legacy wrapper — prefer ``ticker_universe.get_tickers()``."""
     if TEST_MODE:
         logger.info("TEST MODE: Using a small set of test tickers")
         return TEST_TICKERS
-        
-    if not YFINANCE_AVAILABLE:
-        logger.warning("Using a small placeholder list of S&P 500 tickers")
-        # Return a subset of S&P 500 companies as placeholder
-        return [
-            'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'BRK-B', 'UNH', 'XOM', 'JPM',
-            'JNJ', 'V', 'PG', 'MA', 'HD', 'CVX', 'MRK', 'LLY', 'AVGO', 'KO'
-        ]
-    
-    try:
-        logger.info("Fetching S&P 500 tickers from Wikipedia")
-        import urllib.request
-        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        html = urllib.request.urlopen(req).read().decode('utf-8')
-        tables = pd.read_html(html)
-        sp500_df = tables[0]
-        tickers = sp500_df['Symbol'].str.replace('.', '-').tolist()
-        logger.info(f"Found {len(tickers)} S&P 500 constituents")
-        return tickers
-    except Exception as e:
-        logger.error(f"Error fetching S&P 500 tickers: {e}")
-        # Fallback to a small subset
-        return [
-            'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'BRK-B', 'UNH', 'XOM', 'JPM'
-        ]
-        
+    return get_tickers(UNIVERSE_SP500)
+
+
 def fetch_price_data(tickers, start_date=START_DATE, end_date=END_DATE, batch_size=100):
     """
     Fetches historical price data for the given tickers in batches to avoid API limits.
@@ -87,16 +117,19 @@ def fetch_price_data(tickers, start_date=START_DATE, end_date=END_DATE, batch_si
         logger.info(f"Processing batch {i//batch_size + 1}/{(len(tickers) + batch_size - 1)//batch_size}: {len(batch_tickers)} tickers")
         
         try:
-            # Download data for this batch
-            data = yf.download(
-                batch_tickers,
-                start=start_date,
-                end=end_date,
-                group_by='ticker',
-                auto_adjust=False,  # We want to use Adj Close for consistency
-                progress=False,
-                threads=True,
-                ignore_tz=True
+            # Download data for this batch (with retry)
+            data = _retry_with_backoff(
+                lambda bt=batch_tickers: yf.download(
+                    bt,
+                    start=start_date,
+                    end=end_date,
+                    group_by='ticker',
+                    auto_adjust=False,
+                    progress=False,
+                    threads=True,
+                    ignore_tz=True,
+                ),
+                label=f"price batch {i // batch_size + 1}",
             )
             
             # Handle case of single ticker (different structure)
@@ -127,7 +160,13 @@ def fetch_price_data(tickers, start_date=START_DATE, end_date=END_DATE, batch_si
         
         except Exception as e:
             logger.error(f"Error fetching batch {i//batch_size + 1}: {e}")
-            
+
+        # Rate-limit delay between batches (important for large universes)
+        if i + batch_size < len(tickers):
+            price_delay = _get_rate_params(len(tickers))["price_delay"]
+            if price_delay > 0:
+                time_module.sleep(price_delay)
+
     if not all_data:
         logger.error("No price data fetched for any tickers")
         return None
@@ -185,15 +224,15 @@ def create_returns_df(price_df):
     logger.info(f"Returns calculation complete. Shape: {returns_df.shape}")
     return returns_df
     
-def fetch_ticker_info(tickers, batch_size=20):
+def fetch_ticker_info(tickers, batch_size=20, checkpoint_dir=None):
     """
     Fetches .info for all tickers in a single pass, returning shares outstanding
     and sector data. This avoids making duplicate API calls.
 
+    Supports checkpointing for large universes (Russell 3000).
+
     Returns: (shares_data: dict, sector_data: list[dict])
     """
-    import time
-
     if not YFINANCE_AVAILABLE:
         return {}, []
 
@@ -201,16 +240,42 @@ def fetch_ticker_info(tickers, batch_size=20):
 
     shares_data = {}
     sector_data = []
+    completed_tickers = set()
 
-    for i in range(0, len(tickers), batch_size):
-        batch_tickers = tickers[i:i + batch_size]
+    # Load checkpoint if available
+    if checkpoint_dir:
+        cp_file = os.path.join(checkpoint_dir, "ticker_info_checkpoint.parquet")
+        if os.path.exists(cp_file):
+            cp_df = pl.read_parquet(cp_file)
+            for row in cp_df.iter_rows(named=True):
+                completed_tickers.add(row["symbol"])
+                if row.get("shares") and row["shares"] > 0:
+                    shares_data[row["symbol"]] = row["shares"]
+                if row.get("sector"):
+                    sector_data.append({"symbol": row["symbol"], "sector": row["sector"]})
+            logger.info(f"Resumed from checkpoint: {len(completed_tickers)} tickers already done")
+
+    remaining = [t for t in tickers if t not in completed_tickers]
+    total_batches = (len(remaining) + batch_size - 1) // batch_size
+    info_delay = _get_rate_params(len(tickers))["info_delay"]
+    start_time = time_module.time()
+
+    for i in range(0, len(remaining), batch_size):
+        batch_tickers = remaining[i:i + batch_size]
         batch_num = i // batch_size + 1
-        total_batches = (len(tickers) + batch_size - 1) // batch_size
-        logger.info(f"Fetching ticker info - batch {batch_num}/{total_batches}")
+        done = len(completed_tickers) + i + len(batch_tickers)
+        eta = _eta_str(start_time, i + len(batch_tickers), len(remaining))
+        logger.info(
+            f"Ticker info batch {batch_num}/{total_batches} "
+            f"({done}/{len(tickers)} total, ETA: {eta})"
+        )
 
         for ticker in batch_tickers:
             try:
-                info = yf.Ticker(ticker).info
+                info = _retry_with_backoff(
+                    lambda t=ticker: yf.Ticker(t).info,
+                    label=f"info({ticker})",
+                )
 
                 # Shares outstanding
                 for field in ['sharesOutstanding', 'impliedSharesOutstanding']:
@@ -224,10 +289,36 @@ def fetch_ticker_info(tickers, batch_size=20):
             except Exception as e:
                 logger.error(f"Error fetching info for {ticker}: {e}")
 
-        time.sleep(1)  # Rate-limit protection
+        # Save checkpoint every 100 tickers
+        if checkpoint_dir and (i + batch_size) % 100 < batch_size:
+            _save_info_checkpoint(checkpoint_dir, shares_data, sector_data)
+
+        time_module.sleep(info_delay)
+
+    # Final checkpoint
+    if checkpoint_dir:
+        _save_info_checkpoint(checkpoint_dir, shares_data, sector_data)
 
     logger.info(f"Got shares for {len(shares_data)} tickers, sector for {len(sector_data)} tickers")
     return shares_data, sector_data
+
+
+def _save_info_checkpoint(checkpoint_dir, shares_data, sector_data):
+    """Save ticker info progress to a checkpoint file."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    rows = []
+    all_symbols = set(shares_data.keys()) | {d["symbol"] for d in sector_data}
+    sector_map = {d["symbol"]: d["sector"] for d in sector_data}
+    for sym in all_symbols:
+        rows.append({
+            "symbol": sym,
+            "shares": shares_data.get(sym, 0.0),
+            "sector": sector_map.get(sym, ""),
+        })
+    if rows:
+        pl.DataFrame(rows).write_parquet(
+            os.path.join(checkpoint_dir, "ticker_info_checkpoint.parquet")
+        )
 
 
 def fetch_market_cap_data(tickers, price_df=None, shares_data=None, batch_size=20):
@@ -355,40 +446,14 @@ def create_sector_exposure_df(sector_df, price_df):
         # Create a minimal DataFrame with just date and symbol
         return price_df.select(["date", "symbol"]).unique()
         
-def _merge_statements(quarterly_df, annual_df):
-    """Merge quarterly and annual financial statements, preferring quarterly for overlapping dates.
-
-    Quarterly data is more granular but only covers ~1.5 years.
-    Annual data covers 4-5 years. Combining both gives maximum history.
-    When both have data for the same date, quarterly takes precedence.
-    """
-    if quarterly_df.empty and annual_df.empty:
-        return quarterly_df  # return empty
-    if quarterly_df.empty:
-        return annual_df
-    if annual_df.empty:
-        return quarterly_df
-
-    # Get dates unique to annual (not already covered by quarterly)
-    quarterly_dates = set(quarterly_df.columns)
-    annual_only_dates = [d for d in annual_df.columns if d not in quarterly_dates]
-
-    if not annual_only_dates:
-        return quarterly_df  # quarterly already covers everything
-
-    # Combine: quarterly columns first, then annual-only columns
-    import pandas as pd
-    combined = pd.concat([quarterly_df, annual_df[annual_only_dates]], axis=1)
-    return combined
-
-
-def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_date=END_DATE, batch_size=20):
+def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_date=END_DATE,
+                             batch_size=20, checkpoint_dir=None):
     """
     Fetches fundamental data needed for value metrics.
     Returns a DataFrame with: date, symbol, book_price, sales_price, cf_price
-    """
-    import time
 
+    Supports checkpointing for large universes.
+    """
     if not YFINANCE_AVAILABLE:
         logger.warning("Cannot fetch real value metrics. yfinance package not available.")
         return None
@@ -402,56 +467,62 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
     # Collect fundamental snapshots: list of dicts with {date, symbol, book_value, revenue, cash_flow}
     fund_rows = []
     fetched_count = 0
+    completed_tickers = set()
 
-    for i in range(0, len(tickers), batch_size):
-        batch_tickers = tickers[i:i + batch_size]
+    # Load checkpoint if available
+    if checkpoint_dir:
+        cp_file = os.path.join(checkpoint_dir, "fund_data_checkpoint.parquet")
+        if os.path.exists(cp_file):
+            cp_df = pl.read_parquet(cp_file)
+            completed_tickers = set(cp_df["symbol"].unique().to_list())
+            fund_rows = cp_df.to_dicts()
+            fetched_count = len(completed_tickers)
+            logger.info(f"Resumed from checkpoint: {len(completed_tickers)} tickers already done")
+
+    remaining = [t for t in tickers if t not in completed_tickers]
+    total_batches = (len(remaining) + batch_size - 1) // batch_size
+    fund_delay = _get_rate_params(len(tickers))["fund_delay"]
+    start_time = time_module.time()
+
+    for i in range(0, len(remaining), batch_size):
+        batch_tickers = remaining[i:i + batch_size]
         batch_num = i // batch_size + 1
-        total_batches = (len(tickers) + batch_size - 1) // batch_size
-        logger.info(f"Fetching fundamental data - batch {batch_num}/{total_batches}")
+        done = len(completed_tickers) + i + len(batch_tickers)
+        eta = _eta_str(start_time, i + len(batch_tickers), len(remaining))
+        logger.info(
+            f"Fundamental data batch {batch_num}/{total_batches} "
+            f"({done}/{len(tickers)} total, ETA: {eta})"
+        )
 
         for ticker in batch_tickers:
             try:
-                stock = yf.Ticker(ticker)
+                stock = _retry_with_backoff(
+                    lambda t=ticker: yf.Ticker(t),
+                    label=f"Ticker({ticker})",
+                )
 
-                # Combine quarterly + annual data for maximum history coverage
-                # Quarterly gives ~6 quarters (~1.5 yrs), annual gives 4-5 years
-                q_balance = stock.quarterly_balance_sheet
-                q_financials = stock.quarterly_financials
-                q_cashflow = stock.quarterly_cashflow
-                a_balance = stock.balance_sheet
-                a_financials = stock.income_stmt
-                a_cashflow = stock.cashflow
+                # Get balance sheet (quarterly preferred, fall back to annual)
+                balance_sheet = stock.quarterly_balance_sheet
+                if balance_sheet.empty:
+                    balance_sheet = stock.balance_sheet
+                financials = stock.quarterly_financials
+                cash_flow = stock.quarterly_cashflow
 
-                # Track which dates come from quarterly (need *4) vs annual (already annualized)
-                quarterly_dates = set()
-                if not q_balance.empty:
-                    quarterly_dates.update(q_balance.columns.tolist())
-                if not q_financials.empty:
-                    quarterly_dates.update(q_financials.columns.tolist())
-                if not q_cashflow.empty:
-                    quarterly_dates.update(q_cashflow.columns.tolist())
-
-                balance_sheet = _merge_statements(q_balance, a_balance)
-                financials = _merge_statements(q_financials, a_financials)
-                cash_flow_stmt = _merge_statements(q_cashflow, a_cashflow)
-
-                if balance_sheet.empty and financials.empty and cash_flow_stmt.empty:
-                    logger.warning(f"No fundamental data found for {ticker}")
+                if balance_sheet.empty and financials.empty and cash_flow.empty:
                     continue
 
                 # Collect all reporting dates across the three statements
                 all_dates = sorted(set(
                     balance_sheet.columns.tolist() +
                     financials.columns.tolist() +
-                    cash_flow_stmt.columns.tolist()
+                    cash_flow.columns.tolist()
                 ))
 
                 ticker_has_data = False
                 for date in all_dates:
                     row = {'fund_date': pd.Timestamp(date), 'symbol': ticker}
-                    is_quarterly = date in quarterly_dates
 
-                    # Book value = Total Assets - Total Liabilities (no annualization needed)
+                    # Book value = Total Assets - Total Liabilities
                     if not balance_sheet.empty and 'Total Assets' in balance_sheet.index and date in balance_sheet.columns:
                         assets = balance_sheet.loc['Total Assets', date]
                         liab_key = 'Total Liabilities Net Minority Interest'
@@ -459,17 +530,17 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
                         if assets is not None and liabilities is not None and not pd.isna(assets) and not pd.isna(liabilities):
                             row['book_value'] = float(assets - liabilities)
 
-                    # Revenue — annualize quarterly figures (*4), keep annual as-is
+                    # Revenue (annualized from quarterly)
                     if not financials.empty and 'Total Revenue' in financials.index and date in financials.columns:
                         revenue = financials.loc['Total Revenue', date]
                         if revenue is not None and not pd.isna(revenue):
-                            row['revenue'] = float(revenue) * 4 if is_quarterly else float(revenue)
+                            row['revenue'] = float(revenue) * 4
 
-                    # Cash flow — annualize quarterly figures (*4), keep annual as-is
-                    if not cash_flow_stmt.empty and 'Operating Cash Flow' in cash_flow_stmt.index and date in cash_flow_stmt.columns:
-                        cf = cash_flow_stmt.loc['Operating Cash Flow', date]
+                    # Cash flow (annualized from quarterly)
+                    if not cash_flow.empty and 'Operating Cash Flow' in cash_flow.index and date in cash_flow.columns:
+                        cf = cash_flow.loc['Operating Cash Flow', date]
                         if cf is not None and not pd.isna(cf):
-                            row['cash_flow'] = float(cf) * 4 if is_quarterly else float(cf)
+                            row['cash_flow'] = float(cf) * 4
 
                     if len(row) > 2:  # Has at least one metric beyond fund_date and symbol
                         fund_rows.append(row)
@@ -481,8 +552,15 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
             except Exception as e:
                 logger.error(f"Error fetching fundamental data for {ticker}: {e}")
 
-        # Delay between batches to avoid Yahoo Finance rate limiting
-        time.sleep(2)
+        # Save checkpoint every 100 tickers
+        if checkpoint_dir and (i + batch_size) % 100 < batch_size:
+            _save_fund_checkpoint(checkpoint_dir, fund_rows)
+
+        time_module.sleep(fund_delay)
+
+    # Final checkpoint
+    if checkpoint_dir and fund_rows:
+        _save_fund_checkpoint(checkpoint_dir, fund_rows)
 
     logger.info(f"Fetched fundamental data for {fetched_count}/{len(tickers)} tickers")
 
@@ -558,6 +636,16 @@ def fetch_value_metrics_data(tickers, price_df=None, start_date=START_DATE, end_
     logger.info(f"Value metrics DataFrame created. Shape: {value_df.shape}")
     return value_df
 
+def _save_fund_checkpoint(checkpoint_dir, fund_rows):
+    """Save fundamental data progress to a checkpoint file."""
+    if not fund_rows:
+        return
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    pl.DataFrame(fund_rows).write_parquet(
+        os.path.join(checkpoint_dir, "fund_data_checkpoint.parquet")
+    )
+
+
 def _to_date_str(date_val) -> str:
     """Convert a date value (datetime, pd.Timestamp, etc.) to 'YYYY-MM-DD' string."""
     if hasattr(date_val, 'strftime'):
@@ -623,128 +711,173 @@ def align_and_clean_data(returns_df, mkt_cap_df, sector_df, value_df, start_date
 
     return returns_df, mkt_cap_df, sector_df, value_df
     
-def save_data_to_files(returns_df, mkt_cap_df, sector_df, value_df, output_dir=OUTPUT_DIR):
-    """Saves all DataFrames to parquet files."""
+def save_data_to_files(returns_df, mkt_cap_df, sector_df, value_df,
+                       output_dir=None, universe=UNIVERSE_SP500):
+    """Saves all DataFrames to parquet files in a universe-specific directory."""
     if any(df is None or df.is_empty() for df in [returns_df, mkt_cap_df, sector_df, value_df]):
         logger.error("Cannot save data: One or more DataFrames are empty")
         return None
-    
+
+    if output_dir is None:
+        output_dir = _get_output_dir(universe)
+
     # Make sure output directory exists
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Save files
     returns_df.write_parquet(f"{output_dir}/returns_df.parquet")
     mkt_cap_df.write_parquet(f"{output_dir}/mkt_cap_df.parquet")
     sector_df.write_parquet(f"{output_dir}/sector_df.parquet")
     value_df.write_parquet(f"{output_dir}/value_df.parquet")
-    
+
     logger.info(f"Data saved to {output_dir}/")
     return {
         "returns_df": f"{output_dir}/returns_df.parquet",
         "mkt_cap_df": f"{output_dir}/mkt_cap_df.parquet",
-        "sector_df": f"{output_dir}/sector_df.parquet", 
+        "sector_df": f"{output_dir}/sector_df.parquet",
         "value_df": f"{output_dir}/value_df.parquet"
     }
 
-def load_saved_data(input_dir=OUTPUT_DIR):
+def load_saved_data(input_dir=None, universe=UNIVERSE_SP500):
     """
     Loads previously saved data files for use with the factor model.
-    
-    Args:
-        input_dir: Directory containing the parquet files
-        
-    Returns:
-        Tuple of DataFrames: (returns_df, mkt_cap_df, sector_df, value_df)
+
+    Parameters
+    ----------
+    input_dir : str or None
+        Directory containing the parquet files. If None, uses the
+        universe-specific default ``./data/{universe}/``.
+    universe : str
+        Universe name (used to derive *input_dir* when not given explicitly).
+
+    Returns
+    -------
+    Tuple of DataFrames: (returns_df, mkt_cap_df, sector_df, value_df)
     """
+    if input_dir is None:
+        input_dir = _get_output_dir(universe)
+
+    # Backward compat: check if legacy flat layout exists (./data/*.parquet)
+    legacy_dir = OUTPUT_DIR
+    if not os.path.exists(input_dir) and os.path.exists(f"{legacy_dir}/returns_df.parquet"):
+        logger.warning(
+            f"Universe directory {input_dir} not found, but legacy data files "
+            f"exist in {legacy_dir}/. Consider moving them to {input_dir}/."
+        )
+        input_dir = legacy_dir
+
     try:
         logger.info(f"Loading data from {input_dir}")
-        
-        # Check if directory exists
+
         if not os.path.exists(input_dir):
             logger.error(f"Directory {input_dir} does not exist")
             return None, None, None, None
-        
-        # List expected files
+
         files = {
             'returns_df': f"{input_dir}/returns_df.parquet",
             'mkt_cap_df': f"{input_dir}/mkt_cap_df.parquet",
             'sector_df': f"{input_dir}/sector_df.parquet",
             'value_df': f"{input_dir}/value_df.parquet"
         }
-        
-        # Check if all files exist
-        missing_files = []
-        for name, path in files.items():
-            if not os.path.exists(path):
-                missing_files.append(name)
-                
+
+        missing_files = [n for n, p in files.items() if not os.path.exists(p)]
         if missing_files:
             logger.error(f"Missing data files: {', '.join(missing_files)}")
             return None, None, None, None
-        
-        # Load the data
+
         returns_df = pl.read_parquet(files['returns_df'])
         mkt_cap_df = pl.read_parquet(files['mkt_cap_df'])
         sector_df = pl.read_parquet(files['sector_df'])
         value_df = pl.read_parquet(files['value_df'])
-        
-        logger.info(f"Data loaded successfully. Shapes - returns: {returns_df.shape}, market_cap: {mkt_cap_df.shape}, sector: {sector_df.shape}, value: {value_df.shape}")
-        
+
+        logger.info(
+            f"Data loaded successfully. Shapes - returns: {returns_df.shape}, "
+            f"market_cap: {mkt_cap_df.shape}, sector: {sector_df.shape}, "
+            f"value: {value_df.shape}"
+        )
         return returns_df, mkt_cap_df, sector_df, value_df
-    
+
     except Exception as e:
         logger.error(f"Error loading data: {str(e)}")
         return None, None, None, None
 
-def run_loader_and_model(force_refresh=None):
+def run_loader_and_model(force_refresh=None, universe=None):
     """
     Load data (from cache or by fetching fresh), returning the four DataFrames.
 
-    Set force_refresh=True (or the module-level FORCE_REFRESH=True) to
-    re-download from Yahoo Finance even when cached parquet files exist.
+    Parameters
+    ----------
+    force_refresh : bool or None
+        Re-download from Yahoo Finance even when cached parquet files exist.
+        Defaults to the module-level FORCE_REFRESH setting.
+    universe : str or None
+        ``"sp500"`` or ``"russell3000"``. Defaults to the module-level UNIVERSE.
     """
     if force_refresh is None:
         force_refresh = FORCE_REFRESH
+    if universe is None:
+        universe = UNIVERSE
 
-    data_dir = OUTPUT_DIR
+    data_dir = _get_output_dir(universe)
     parquet_files = [f"{data_dir}/{f}.parquet" for f in
                      ("returns_df", "mkt_cap_df", "sector_df", "value_df")]
 
     if not force_refresh and all(os.path.exists(f) for f in parquet_files):
-        logger.info("Found existing data files, loading them...")
-        result = load_saved_data()
+        logger.info(f"Found existing {universe} data files, loading them...")
+        result = load_saved_data(universe=universe)
         if result[0] is not None:
             logger.info("Successfully loaded existing data")
             return result
 
-    logger.info("Fetching new data...")
-    main()
-    return load_saved_data()
+    logger.info(f"Fetching new data for universe={universe}...")
+    main(universe=universe)
+    return load_saved_data(universe=universe)
 
-def main():
-    """Main entry point for the script."""
+def main(universe=None):
+    """Main entry point for the data collection pipeline.
+
+    Parameters
+    ----------
+    universe : str or None
+        ``"sp500"`` or ``"russell3000"``. Defaults to the module-level UNIVERSE.
+    """
+    if universe is None:
+        universe = UNIVERSE
+
     try:
-        logger.info(f"Starting data collection for S&P 500 from {START_DATE} to {END_DATE}")
-        
-        # 1. Get S&P 500 tickers
-        tickers = get_sp500_tickers()
+        logger.info(f"Starting data collection for {universe} from {START_DATE} to {END_DATE}")
+
+        # 1. Get tickers for the requested universe
+        if TEST_MODE:
+            tickers = TEST_TICKERS
+            logger.info(f"TEST MODE: Using {len(tickers)} test tickers")
+        else:
+            tickers = get_tickers(universe)
         if not tickers:
             logger.error("No tickers found, exiting.")
             return
-        
+
+        logger.info(f"Universe {universe}: {len(tickers)} tickers")
+
+        # Rate-limit parameters tuned to universe size
+        rate = _get_rate_params(len(tickers))
+        checkpoint_dir = os.path.join(_get_output_dir(universe), ".checkpoints")
+
         # 2. Fetch price data and calculate returns
-        price_df = fetch_price_data(tickers)
+        price_df = fetch_price_data(tickers, batch_size=rate["price_batch"])
         if price_df is None or price_df.is_empty():
             logger.error("Failed to fetch price data, exiting.")
             return
-            
+
         returns_df = create_returns_df(price_df)
         if returns_df is None or returns_df.is_empty():
             logger.error("Failed to calculate returns, exiting.")
             return
-        
-        # 3. Fetch ticker info (shares + sector) in a single pass to reduce API calls
-        shares_data, sector_list = fetch_ticker_info(tickers)
+
+        # 3. Fetch ticker info (shares + sector) in a single pass
+        shares_data, sector_list = fetch_ticker_info(
+            tickers, batch_size=rate["info_batch"], checkpoint_dir=checkpoint_dir
+        )
 
         # 4. Compute market cap from shares outstanding + prices
         mkt_cap_df = fetch_market_cap_data(tickers, price_df, shares_data=shares_data)
@@ -764,23 +897,25 @@ def main():
         sector_info_df = fetch_sector_data(tickers, sector_data=sector_list)
         if sector_info_df is None or sector_info_df.is_empty():
             logger.warning("Failed to fetch sector data, creating fallback sectors...")
-            # Create fallback sector data
             sectors = ['Technology', 'Financials', 'Healthcare', 'Energy', 'Consumer']
             sector_data = []
             for ticker in tickers:
                 sector_data.append({
                     'symbol': ticker,
-                    'sector': sectors[hash(ticker) % len(sectors)]  # Assign based on hash
+                    'sector': sectors[hash(ticker) % len(sectors)]
                 })
             sector_info_df = pl.DataFrame(sector_data)
-        
+
         sector_df = create_sector_exposure_df(sector_info_df, price_df)
         if sector_df is None:
             logger.error("Failed to create sector exposure data, exiting.")
             return
-        
+
         # 6. Fetch value metrics (fundamentals) data
-        value_df = fetch_value_metrics_data(tickers, price_df)
+        value_df = fetch_value_metrics_data(
+            tickers, price_df, batch_size=rate["fund_batch"],
+            checkpoint_dir=checkpoint_dir,
+        )
         if value_df is None or value_df.is_empty():
             logger.error("Failed to create value metrics, exiting.")
             return
@@ -789,18 +924,39 @@ def main():
         aligned_dfs = align_and_clean_data(returns_df, mkt_cap_df, sector_df, value_df)
         if aligned_dfs[0] is None:
             logger.error("Data alignment failed, saving unaligned data...")
-            # Save the unaligned data
-            save_data_to_files(returns_df, mkt_cap_df, sector_df, value_df)
+            save_data_to_files(returns_df, mkt_cap_df, sector_df, value_df, universe=universe)
         else:
-            # Save aligned data
             returns_df, mkt_cap_df, sector_df, value_df = aligned_dfs
-            save_data_to_files(returns_df, mkt_cap_df, sector_df, value_df)
-        
-        logger.info("S&P 500 data collection complete")
-        
+            save_data_to_files(returns_df, mkt_cap_df, sector_df, value_df, universe=universe)
+
+        # Clean up checkpoints on success
+        if os.path.exists(checkpoint_dir):
+            import shutil
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
+            logger.info("Cleaned up checkpoint files")
+
+        logger.info(f"{universe} data collection complete")
+
     except Exception as e:
         logger.error(f"Error in data collection process: {str(e)}")
         logger.exception("Stack trace:")
-        
+
+
 if __name__ == "__main__":
-    main() 
+    import argparse
+    parser = argparse.ArgumentParser(description="Fetch equity data for factor model")
+    parser.add_argument(
+        "--universe", default=UNIVERSE_SP500,
+        choices=[UNIVERSE_SP500, UNIVERSE_RUSSELL3000],
+        help="Ticker universe to fetch (default: sp500)",
+    )
+    parser.add_argument("--force-refresh", action="store_true",
+                        help="Re-fetch even if cached data exists")
+    parser.add_argument("--test", action="store_true",
+                        help="Use a small set of test tickers for quick iteration")
+    args = parser.parse_args()
+    if args.test:
+        TEST_MODE = True
+    if args.force_refresh:
+        FORCE_REFRESH = True
+    main(universe=args.universe)

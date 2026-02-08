@@ -2,12 +2,13 @@
 Equity Factor Model Runner
 
 This script demonstrates how to:
-1. Fetch S&P 500 data using the Yahoo Finance data loader
-2. Construct style factors 
+1. Fetch equity data (S&P 500 or Russell 3000) using the Yahoo Finance data loader
+2. Construct style factors
 3. Run the factor model estimation
 4. Analyze and visualize the results
 """
 
+import argparse
 import polars as pl
 import numpy as np
 import matplotlib.pyplot as plt
@@ -26,16 +27,22 @@ logger = logging.getLogger('factor_model_runner')
 # Import our modules
 from toraniko import styles, model
 from toraniko.yfinance_data_loader import run_loader_and_model
+from toraniko.ticker_universe import UNIVERSE_SP500, UNIVERSE_RUSSELL3000
 
-def run_full_model():
+def run_full_model(universe=UNIVERSE_SP500):
     """
     Run the complete factor model pipeline from data loading to visualization.
+
+    Parameters
+    ----------
+    universe : str
+        ``"sp500"`` or ``"russell3000"``.
     """
-    logger.info("Starting the equity factor model pipeline")
-    
+    logger.info(f"Starting the equity factor model pipeline (universe={universe})")
+
     # 1. Load data (or fetch if not available)
-    logger.info("Loading S&P 500 data")
-    returns_df, mkt_cap_df, sector_df, value_df = run_loader_and_model()
+    logger.info(f"Loading {universe} data")
+    returns_df, mkt_cap_df, sector_df, value_df = run_loader_and_model(universe=universe)
     
     if any(df is None for df in [returns_df, mkt_cap_df, sector_df, value_df]):
         logger.error("Failed to load required data")
@@ -232,4 +239,11 @@ def run_full_model():
     logger.info("Analysis complete. Results saved to ./plots/ directory")
 
 if __name__ == "__main__":
-    run_full_model() 
+    parser = argparse.ArgumentParser(description="Run the equity factor model")
+    parser.add_argument(
+        "--universe", default=UNIVERSE_SP500,
+        choices=[UNIVERSE_SP500, UNIVERSE_RUSSELL3000],
+        help="Ticker universe to use (default: sp500)",
+    )
+    args = parser.parse_args()
+    run_full_model(universe=args.universe)
